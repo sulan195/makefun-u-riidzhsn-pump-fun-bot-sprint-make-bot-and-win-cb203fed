@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import { BPS } from './vendor/makefun-bot.ts';
 import type { Batch, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
@@ -188,7 +189,9 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       return params.baseSplit;
     }
     const behind = due - filled;
-    const extra = behind > params.fillTarget * 0.15 ? 2 : 1;
+    // Integer comparison (behind * 100 > fillTarget * 15): the old float
+    // `fillTarget * 0.15` could round differently across JS runtimes.
+    const extra = behind * 100 > params.fillTarget * 15 ? 2 : 1;
     return Math.min(params.maxSplit, params.baseSplit + extra);
   }
 

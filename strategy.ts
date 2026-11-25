@@ -18,7 +18,7 @@ export interface Params {
 export const DEFAULT_PARAMS: Params = {
   minAge: 0, maxAge: 3, stakeLamports: 50_000_000, minBuyLamports: 5_000_000,
   maxAdds: 0, addStepBps: 0, addDelay: 2, addLamports: 100_000_000, addMinFlowLamports: 0,
-  minRealSol: 300_000_000, maxRealSol: 30_000_000_000, minDevBuy: 0, maxDevBuy: 2_500_000_000,
+  minRealSol: 1_000_000_000, maxRealSol: 30_000_000_000, minDevBuy: 0, maxDevBuy: 2_500_000_000,
   minTrades: 0, minBuyers: 0, maxBuyers: 3,
   maxSellRatioBps: 10_000, maxBigSellBps: 10_000, minRunupBps: 0, maxRunupBps: 1_000_000,
   flowWindow: 10, minFlowLamports: -1_000_000_000_000, minRecentBuyers: 0,
@@ -26,7 +26,7 @@ export const DEFAULT_PARAMS: Params = {
   tp1Bps: 1_000_000, tp1PartBps: 5_000, slAfterTp1Bps: 0,
   tpBps: 2_000, slBps: 800, trailArmBps: 1_000_000, trailBps: 1_000,
   maxHold: 20, exitOnDevSell: true, staleSlots: 1_000_000, exitFlowLamports: 1_000_000_000_000,
-  fillTarget: 300, windowSeconds: 21_600, baseSplit: 1, maxSplit: 6, minPieceLamports: 2_000_000,
+  fillTarget: 300, windowSeconds: 21_600, baseSplit: 1, maxSplit: 1, minPieceLamports: 2_000_000,
 };
 
 export interface Strategy {
@@ -57,6 +57,7 @@ interface Coin {
   recent: TradeTick[];
   buysSent: number;
   spentSent: bigint;
+  devSoldAtBuy: boolean;
   lastBuyVq: bigint;
   lastBuyVt: bigint;
   lastBuySlot: number;
@@ -70,6 +71,7 @@ interface Held {
   best: bigint;
   devSoldAtOpen: boolean;
   tookTp1: boolean;
+  exiting: boolean;
 }
 
 interface FlowStats {
@@ -288,6 +290,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
             recent: [],
             buysSent: 0,
             spentSent: 0n,
+            devSoldAtBuy: false,
             lastBuyVq: 0n,
             lastBuyVt: 0n,
             lastBuySlot: ev.slot,
@@ -298,6 +301,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       } else if (ev.event === 'TradeEvent') {
         const coin = coins.get(ev.mint);
         if (coin === undefined) continue;
+        // Retired, unheld coins are dead: stop growing their tape (buyers Set
+        // and recent ticks are unbounded otherwise; see review finding 6).
+        // Held coins keep updating — exits read devSold/lastTradeSlot/flow.
+        if (coin.done && !held.has(coin.mint)) continue;
 
         const sol = BigInt(ev.sol_amount);
         coin.trades++;
@@ -375,8 +382,12 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           openedSlot: f.slot,
           txPaid: txFee,
           best: 0n,
-          devSoldAtOpen: coin?.devSold ?? false,
+          // Snapshot from BUY SUBMISSION time (coin.devSoldAtBuy), not the
+          // fill slot: a creator dump during the 2-slot buy latency must
+          // still trigger the dev-sell exit (review finding 1).
+          devSoldAtOpen: coin?.devSoldAtBuy ?? false,
           tookTp1: false,
+          exiting: false,
         });
       }
     }
@@ -403,6 +414,21 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       const hasPosition = pos !== undefined && pos.token_amount > 0n;
       if (!hasPosition && !selling.has(mint) && !pendingBuyMints.has(mint)) {
         held.delete(mint);
+      }
+    }
+
+    // Evict retired/completed coins with no open position, no pending buy
+    // and no held entry: keeps the per-batch entry scan bounded under
+    // high-launch-volume windows (review finding 6).
+    for (const mint of coins.keys()) {
+      const c = coins.get(mint)!;
+      if (
+        (c.done || c.complete) &&
+        !held.has(mint) &&
+        !state.positions.has(mint) &&
+        !pendingBuyMints.has(mint)
+      ) {
+        coins.delete(mint);
       }
     }
 
@@ -435,16 +461,24 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           openedSlot: state.slot,
           txPaid: tx,
           best: 0n,
-          devSoldAtOpen: coin?.devSold ?? false,
+          devSoldAtOpen: coin?.devSoldAtBuy ?? coin?.devSold ?? false,
           tookTp1: false,
+          exiting: false,
         };
         held.set(mint, h);
       }
 
+      // Prefer a fresh mark, but only when both reserves are positive; a
+      // zero-reserve mark (vq = 0 or vt = 0) would make sellValue return 0
+      // and falsely trigger the stop-loss (review finding 3).
       const mark = marks.get(mint);
-      const vq = mark !== undefined ? mark.vq : curve?.virtual_quote_reserves;
-      const vt = mark !== undefined ? mark.vt : curve?.virtual_token_reserves;
-      if (vq === undefined || vt === undefined) continue;
+      let vq = curve?.virtual_quote_reserves;
+      let vt = curve?.virtual_token_reserves;
+      if (mark !== undefined && mark.vq > 0n && mark.vt > 0n) {
+        vq = mark.vq;
+        vt = mark.vt;
+      }
+      if (vq === undefined || vt === undefined || vq <= 0n || vt <= 0n) continue;
 
       const value = sellValue(pos.token_amount, vq, vt) - tx;
       const basis = pos.cost_lamports + h.txPaid;
@@ -472,7 +506,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         }
       }
 
-      let exit = false;
+      // A decided exit stays decided (sticky): a failed/rejected split-sell
+      // remainder must be retried next batch even if the trigger condition
+      // transiently clears (review finding 4).
+      let exit = h.exiting;
       if (basis > 0n) {
         // (b) Full take-profit.
         if (value * BPS >= basis * (BPS + tpBps)) {
@@ -510,6 +547,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       }
 
       if (exit) {
+        h.exiting = true;
         const sells = sellOrders(mint, pos.token_amount, k, cap - orders.length);
         if (sells.length > 0) {
           orders.push(...sells);
@@ -536,7 +574,18 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       if (age < params.minAge) continue;
 
       if (isAdd) {
-        if (coin.buysSent > params.maxAdds) continue;
+        // A failed/rejected buy leaves no position and no retry: retire the
+        // coin instead of leaving it done === false forever (review finding 5).
+        if (coin.buysSent > params.maxAdds) {
+          if (
+            !state.positions.has(coin.mint) &&
+            !pendingBuyMints.has(coin.mint) &&
+            !held.has(coin.mint)
+          ) {
+            coin.done = true;
+          }
+          continue;
+        }
         const pos = state.positions.get(coin.mint);
         if (pos === undefined || pos.token_amount <= 0n) continue;
         if (selling.has(coin.mint) || pendingBuyMints.has(coin.mint)) continue;
@@ -555,13 +604,15 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         const maxBuy = state.maxBuyLamports(coin.mint);
         const amount = addLamports < maxBuy ? addLamports : maxBuy;
         if (amount < minBuyLamports) continue;
-        if (free < amount + tx * 6n) continue;
 
         const buys = buyOrders(coin.mint, amount, k, cap - orders.length);
         if (buys.length === 0) continue;
+        // Reserve exactly the tx fees this split will cost (review finding 7).
+        if (free < amount + tx * BigInt(buys.length)) continue;
         orders.push(...buys);
         free -= amount + tx * BigInt(buys.length);
         coin.buysSent++;
+        if (coin.buysSent === 1) coin.devSoldAtBuy = coin.devSold;
         coin.spentSent += amount;
         coin.lastBuyVq = vq;
         coin.lastBuyVt = vt;
@@ -611,13 +662,17 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       const maxBuy = state.maxBuyLamports(coin.mint);
       const amount = room < maxBuy ? room : maxBuy;
       if (amount < minBuyLamports) continue;
-      if (free < amount + tx * 6n) continue;
 
       const buys = buyOrders(coin.mint, amount, k, cap - orders.length);
       if (buys.length === 0) continue;
+      // Reserve exactly the tx fees this split will cost (review finding 7).
+      if (free < amount + tx * BigInt(buys.length)) continue;
       orders.push(...buys);
       free -= amount + tx * BigInt(buys.length);
       coin.buysSent++;
+      // Snapshot the creator-sold flag at SUBMISSION time for the dev-sell
+      // exit (review finding 1).
+      if (coin.buysSent === 1) coin.devSoldAtBuy = coin.devSold;
       coin.spentSent += amount;
       coin.lastBuyVq = vq;
       coin.lastBuyVt = vt;

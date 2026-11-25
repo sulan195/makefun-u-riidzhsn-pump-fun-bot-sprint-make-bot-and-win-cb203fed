@@ -393,6 +393,25 @@ test('exit: maxHold 20 slots sells even when the price is flat', () => {
   assert.equal(orders[0]!.side, 'sell');
 });
 
+test('exit: creator sells during the 2-slot buy latency -> exit still fires', () => {
+  const sim = new Sim();
+  const orders = sim.batch(100, goodTape(MINT_A, 100));
+  assert.equal(orders.length, 1);
+  const buy = orders[0]!;
+  // Creator dumps in the latency window (slot 101), before the fill lands.
+  const dump = sim.batch(101, [
+    tradeEvent(MINT_A, 101, CREATOR, false, 100_000_000n, 31_400_000_000n, 955_000_000_000n, 1_400_000_000n),
+  ]);
+  assert.equal(dump.length, 0);
+  // Fill arrives at slot 102; the dev-sell exit must fire in the same reply
+  // because devSoldAtOpen was snapshotted (false) at submission, not at fill.
+  const f = fill(buy.client_id, MINT_A, 'buy', 'filled', 100, 102, 15_000_000n, 467_800_000n);
+  sim.applyBuyFill(f);
+  const exit = sim.batch(102, [], [], [f]);
+  assert.equal(exit.length, 1);
+  assert.equal(exit[0]!.side, 'sell');
+});
+
 test('exit: creator sells while held -> immediate exit', () => {
   const sim = new Sim();
   buyMintA(sim);
@@ -401,6 +420,18 @@ test('exit: creator sells while held -> immediate exit', () => {
   ]);
   assert.equal(orders.length, 1);
   assert.equal(orders[0]!.side, 'sell');
+});
+
+test('exit: mark with zero reserves is ignored (falls back to curve)', () => {
+  const sim = new Sim();
+  buyMintA(sim);
+  // Mark reports vt = 0; the same batch's trade keeps the curve valid and
+  // flat. Before the fix the zero mark made sellValue return 0 and falsely
+  // triggered the stop-loss.
+  const orders = sim.batch(104, [
+    tradeEvent(MINT_A, 104, U1, true, 100_000_000n, 31_500_000_000n, 952_000_000_000n, 1_500_000_000n),
+  ], [mark(MINT_A, 104, 40_000_000_000n, 0n, 1_500_000_000n)]);
+  assert.equal(orders.length, 0);
 });
 
 test('exit: marks missing -> price falls back to curve reserves from the trade', () => {
@@ -468,7 +499,23 @@ test('failure: sell rejected for insufficient_tokens -> re-sell the remaining to
   assert.equal(dup.length, 0);
 });
 
-test('safety: reply never exceeds 16 orders even when pacing splits every order', () => {
+test('exit: rejected sell is retried even after the exit condition clears (sticky exit)', () => {
+  const sim = new Sim();
+  const buy = buyMintA(sim);
+  void buy;
+  const tpMark = [mark(MINT_A, 104, 40_000_000_000n, 952_000_000_000n, 1_500_000_000n)];
+  const sells = sim.batch(104, [], tpMark);
+  assert.equal(sells.length, 1);
+  const sell = sells[0]!;
+  const rej = fill(sell.client_id, MINT_A, 'sell', 'rejected', 104, 106, 0n, 0n, 'insufficient_tokens');
+  // The reject batch carries a FLAT mark: the TP condition has cleared, but
+  // the decided exit is sticky and the sell is retried anyway.
+  const resend = sim.batch(106, [], [mark(MINT_A, 106, 31_500_000_000n, 952_000_000_000n, 1_500_000_000n)], [rej]);
+  assert.equal(resend.length, 1);
+  assert.equal(resend[0]!.side, 'sell');
+});
+
+test('safety: reply never exceeds 16 orders even when pacing is far behind (splitting disabled)', () => {
   const sim = new Sim();
   const mints = [MINT_A, MINT_B, MINT_C, MINT_D, MINT_E];
   // Batch 1: buy all five coins (one piece each while pacing is on schedule).
@@ -481,8 +528,8 @@ test('safety: reply never exceeds 16 orders even when pacing splits every order'
   for (const f of fills) sim.applyBuyFill(f);
   assert.equal(sim.batch(102, [], [], fills).length, 0);
   // Batch 3: jump block_time ~20_000s into the window with only 5 fills done:
-  // pacing is far behind its 300-fill schedule, so each sell splits 3 ways.
-  // 5 positions x 3 pieces = 15 orders, still within the 16-order cap.
+  // pacing is far behind its 300-fill schedule, but order splitting is
+  // disabled (maxSplit 1), so each sell is a single order: 5 sells total.
   const marks = mints.map((m) => {
     const mk = mark(m, 103, 40_000_000_000n, 952_000_000_000n, 1_500_000_000n);
     mk.slot = 103;
@@ -493,7 +540,7 @@ test('safety: reply never exceeds 16 orders even when pacing splits every order'
   );
   for (const e of events) e.block_time = 1_700_020_000;
   const orders = sim.batch(103, events, marks);
-  assert.equal(orders.length, 15, `expected 5 sells x 3 pieces, got ${orders.length}`);
+  assert.equal(orders.length, 5, `expected 5 sells x 1 piece, got ${orders.length}`);
   assert.ok(orders.length <= 16);
   assert.ok(orders.every((o) => o.side === 'sell'));
 });

@@ -350,11 +350,14 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
     }
 
     // 3. Build batch marks lookup and read batch order cap + per-order tx fee.
-    const marks = new Map<Pubkey, ReservePair>();
+    // The mark's slot is kept: a mark older than the curve's latest reserves
+    // is stale and must not override a newer trade (Luna finding 1).
+    const marks = new Map<Pubkey, ReservePair & { slot: number }>();
     for (const m of batch.marks) {
       marks.set(m.mint, {
         vq: BigInt(m.virtual_quote_reserves),
         vt: BigInt(m.virtual_token_reserves),
+        slot: m.slot,
       });
     }
     const cap = state.hello.caps.max_orders_per_batch;
@@ -471,12 +474,16 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       // Prefer a fresh mark, but only when both reserves are positive; a
       // zero-reserve mark (vq = 0 or vt = 0) would make sellValue return 0
       // and falsely trigger the stop-loss (review finding 3).
+      // A mark older than the curve's latest reserves is stale: the curve
+      // already reflects a newer trade, so the mark must not win (Luna 1).
       const mark = marks.get(mint);
       let vq = curve?.virtual_quote_reserves;
       let vt = curve?.virtual_token_reserves;
       if (mark !== undefined && mark.vq > 0n && mark.vt > 0n) {
-        vq = mark.vq;
-        vt = mark.vt;
+        if (curve === undefined || mark.slot >= curve.reserves_slot) {
+          vq = mark.vq;
+          vt = mark.vt;
+        }
       }
       if (vq === undefined || vt === undefined || vq <= 0n || vt <= 0n) continue;
 

@@ -434,6 +434,19 @@ test('exit: mark with zero reserves is ignored (falls back to curve)', () => {
   assert.equal(orders.length, 0);
 });
 
+test('exit: stale mark (older than the latest trade) is ignored, curve wins', () => {
+  const sim = new Sim();
+  buyMintA(sim);
+  // The trade moves the curve +27% (TP territory); the mark is one slot older
+  // and still shows the flat price. Before the fix the stale mark won and
+  // the TP never fired.
+  const orders = sim.batch(104, [
+    tradeEvent(MINT_A, 104, U1, true, 2n * SOL, 40_000_000_000n, 952_000_000_000n, 3_500_000_000n),
+  ], [mark(MINT_A, 103, 31_500_000_000n, 952_000_000_000n, 1_500_000_000n)]);
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0]!.side, 'sell');
+});
+
 test('exit: marks missing -> price falls back to curve reserves from the trade', () => {
   const sim = new Sim();
   buyMintA(sim);
